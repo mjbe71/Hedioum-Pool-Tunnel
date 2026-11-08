@@ -123,18 +123,59 @@ func findNode(cfg *config.AppConfig, alias string) *config.ForeignNode {
 // is taken on this host (or by another reverse node) is moved to a free candidate
 // automatically; an explicit override that is taken is an error.
 func planReverse(cfg *config.AppConfig, node *config.ForeignNode, overrides map[string]int, sni string) (reversePlan, error) {
-	var types []string
+	return planReverseFor(cfg, node, overrides, sni, false, nil)
+}
+
+// planReverseFor is planReverse with the choice of listener set. By default a node that
+// is flipped to reverse gets ONE listener, the TLS mimic (normally on 443, behind a front
+// proxy if the port is shared): every extra public listener on the hub is one more port
+// to probe, and in reverse mode only a TLS-type pipe is useful anyway (SSH cannot be
+// used). Extra types are opt-in: naming them in --ports or --advertise-ports (wanted), or
+// all of the node's own set with allTypes (--all-mimics). A node that is already reverse
+// keeps the types it has.
+func planReverseFor(cfg *config.AppConfig, node *config.ForeignNode, overrides map[string]int, sni string, allTypes bool, wanted []string) (reversePlan, error) {
+	var nodeTypes []string
 	for _, e := range node.Endpoints {
-		types = append(types, e.Mimic)
+		nodeTypes = append(nodeTypes, e.Mimic)
 	}
-	types = reverseCapableTypes(types)
-	if len(types) == 0 {
+	nodeTypes = reverseCapableTypes(nodeTypes)
+	if len(nodeTypes) == 0 {
 		resolved, err := persona.Resolve(persona.Auto(node.AuthToken), node.AuthToken)
 		if err != nil {
 			return reversePlan{}, fmt.Errorf("cannot derive a reverse mimic set: %v", err)
 		}
-		types = reverseCapableTypes(resolved)
+		nodeTypes = reverseCapableTypes(resolved)
 	}
+	var types []string
+	switch {
+	case allTypes:
+		types = nodeTypes
+	case node.Reverse && len(node.ReverseListeners) > 0:
+		for _, l := range node.ReverseListeners {
+			types = append(types, l.Type)
+		}
+	default:
+		types = []string{"tls"}
+	}
+	have := map[string]bool{}
+	for _, ty := range types {
+		have[ty] = true
+	}
+	extraSet := map[string]bool{}
+	for ty := range overrides {
+		extraSet[ty] = true
+	}
+	for _, ty := range wanted {
+		extraSet[ty] = true
+	}
+	extra := make([]string, 0, len(extraSet))
+	for ty := range extraSet {
+		if !have[ty] {
+			extra = append(extra, ty)
+		}
+	}
+	sort.Strings(extra)
+	types = append(types, extra...)
 
 	ports := currentNodePorts(*node)
 	usedByOthers := map[int]string{}
@@ -258,6 +299,8 @@ type reverseOpts struct {
 	// front-proxy settings), so one SNI carries several foreign servers. It needs the
 	// advanced shared_reverse_auth setting; the hub then tells the nodes apart by token.
 	ShareWith string
+	// AllTypes opens a listener for every mimic type of the node instead of the TLS one.
+	AllTypes bool
 }
 
 func validDecoyStyle(s string) error {
@@ -297,7 +340,7 @@ func applyReverseIran(cfg *config.AppConfig, alias string, overrides map[string]
 		plan.Warnings = append(plan.Warnings, fmt.Sprintf("this node shares the listener of %q: the hub tells the two foreign servers apart by token", src.Alias))
 	} else {
 		var err error
-		plan, err = planReverse(cfg, node, overrides, opts.SNI)
+		plan, err = planReverseFor(cfg, node, overrides, opts.SNI, opts.AllTypes, nil)
 		if err != nil {
 			return reversePlan{}, "", err
 		}
@@ -605,6 +648,7 @@ func cmdReverseIran(args []string) {
 	advertise := fs.String("advertise-ports", "", "ports the foreign dials, as TYPE=PORT,... when a front proxy (nginx stream) forwards them to the listener ports (remembered; \"\" clears)")
 	bind := fs.String("bind", "", "address the listeners bind to (127.0.0.1 behind a front proxy; \"\" = all interfaces; remembered)")
 	proxyProto := fs.Bool("proxy-protocol", false, "require a PROXY protocol header from the front proxy (nginx proxy_protocol on / HAProxy send-proxy; remembered)")
+	allMimics := fs.Bool("all-mimics", false, "open a listener for every mimic type of the node (default: one TLS listener; name extra types in --ports)")
 	shareWith := fs.String("share-with", "", "advanced: join this reverse node's listener (same port/SNI) instead of getting its own; needs `reverse-shared-auth --on`")
 	decoy := fs.String("decoy-style", "", "decoy shown to unauthorized probes: apache|directadmin (default: the node's, else the hub's)")
 	forward := fs.Bool("forward", false, "flip the node back to the normal mode (the hub dials the foreign)")
@@ -640,7 +684,7 @@ func cmdReverseIran(args []string) {
 	if err != nil {
 		fail("--advertise-ports: %v", err)
 	}
-	opts := reverseOpts{SNI: *sni, Decoy: *decoy, Advertise: adv, ShareWith: *shareWith}
+	opts := reverseOpts{SNI: *sni, Decoy: *decoy, Advertise: adv, ShareWith: *shareWith, AllTypes: *allMimics}
 	fs.Visit(func(f *flag.Flag) { // only flags that were actually given change the node
 		switch f.Name {
 		case "advertise-ports":

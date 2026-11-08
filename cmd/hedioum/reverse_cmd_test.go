@@ -78,7 +78,7 @@ func TestPlanReverseMovesTakenPorts(t *testing.T) {
 		config.Endpoint{Target: "1.2.3.4:8443", Mimic: "https-alt"},
 	)
 	cfg := &config.AppConfig{Role: "iran", ForeignNodes: []config.ForeignNode{n}}
-	plan, err := planReverse(cfg, &cfg.ForeignNodes[0], nil, "")
+	plan, err := planReverseFor(cfg, &cfg.ForeignNodes[0], nil, "", true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestApplyReverseAdvertisePorts(t *testing.T) {
 	fakePortsInUse(t)
 	n := planTestNode("a", config.Endpoint{Target: "1.2.3.4:8443", Mimic: "https-alt"})
 	cfg := &config.AppConfig{Role: "iran", ForeignNodes: []config.ForeignNode{n}}
-	plan, tok, err := applyReverseIran(cfg, "a", nil, "198.51.100.7", reverseOpts{Advertise: map[string]int{"https-alt": 443}, AdvertiseSet: true})
+	plan, tok, err := applyReverseIran(cfg, "a", nil, "198.51.100.7", reverseOpts{AllTypes: true, Advertise: map[string]int{"https-alt": 443}, AdvertiseSet: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,13 +369,13 @@ func TestFrontProxySnippets(t *testing.T) {
 // its token advertises the same public port.
 func TestShareWithNeedsTheAdvancedSetting(t *testing.T) {
 	fakePortsInUse(t)
-	a := planTestNode("a", config.Endpoint{Target: "1.2.3.4:8443", Mimic: "https-alt"})
-	b := planTestNode("b", config.Endpoint{Target: "5.6.7.8:8443", Mimic: "https-alt"})
+	a := planTestNode("a", config.Endpoint{Target: "1.2.3.4:8443", Mimic: "tls"})
+	b := planTestNode("b", config.Endpoint{Target: "5.6.7.8:8443", Mimic: "tls"})
 	b.AuthToken = "fedcba9876543210fedcba9876543210"
 	cfg := &config.AppConfig{Role: "iran", ForeignNodes: []config.ForeignNode{a, b}}
 
 	if _, _, err := applyReverseIran(cfg, "a", nil, "198.51.100.7", reverseOpts{
-		SNI: "t.example.com", AdvertiseSet: true, Advertise: map[string]int{"https-alt": 443},
+		SNI: "t.example.com", AdvertiseSet: true, Advertise: map[string]int{"tls": 443},
 		Bind: sp("127.0.0.1"), ProxyProtocol: bp(true),
 	}); err != nil {
 		t.Fatal(err)
@@ -395,14 +395,14 @@ func TestShareWithNeedsTheAdvancedSetting(t *testing.T) {
 	if !reflect.DeepEqual(na.ReverseListeners, nb.ReverseListeners) {
 		t.Fatalf("listeners differ: %+v vs %+v", na.ReverseListeners, nb.ReverseListeners)
 	}
-	if nb.ReverseBind != "127.0.0.1" || !nb.ReverseProxyProtocol || nb.ReverseAdvertise["https-alt"] != 443 {
+	if nb.ReverseBind != "127.0.0.1" || !nb.ReverseProxyProtocol || nb.ReverseAdvertise["tls"] != 443 {
 		t.Fatalf("front-proxy settings not copied: %+v", nb)
 	}
 	if plan.SNI != "t.example.com" || tok == "" {
 		t.Fatalf("plan %+v tok %q", plan, tok)
 	}
 	pt, _, err := pairing.Decode(tok)
-	if err != nil || pt.Endpoints["https-alt"] != 443 || pt.AuthKey != nb.AuthToken || !pt.Reverse {
+	if err != nil || pt.Endpoints["tls"] != 443 || pt.AuthKey != nb.AuthToken || !pt.Reverse {
 		t.Fatalf("token wrong: %+v err=%v", pt, err)
 	}
 
@@ -430,5 +430,41 @@ func TestShareWithRejectsBadSources(t *testing.T) {
 	}
 	if _, _, err := applyReverseIran(cfg, "b", nil, "198.51.100.7", reverseOpts{ShareWith: "a", SNI: "other.example.com"}); err == nil {
 		t.Error("a different SNI on a shared listener must fail")
+	}
+}
+
+// A node flipped to reverse gets ONE listener, the TLS mimic, whatever its own mimic set
+// is: every extra public listener on the hub is one more port to probe, and SSH cannot be
+// used in reverse. Extra types are opt-in and a re-plan keeps what the node already has.
+func TestPlanReverseDefaultsToOneTLSListener(t *testing.T) {
+	fakePortsInUse(t)
+	n := planTestNode("a",
+		config.Endpoint{Target: "1.2.3.4:22", Mimic: "ssh"},
+		config.Endpoint{Target: "1.2.3.4:465", Mimic: "smtps"},
+		config.Endpoint{Target: "1.2.3.4:8443", Mimic: "https-alt"},
+	)
+	cfg := &config.AppConfig{Role: "iran", ForeignNodes: []config.ForeignNode{n}}
+	plan, err := planReverse(cfg, &cfg.ForeignNodes[0], nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Listeners) != 1 || plan.Listeners[0].Type != "tls" {
+		t.Fatalf("default must be a single tls listener, got %+v", plan.Listeners)
+	}
+	// Opt in to more by naming them, or take the node's whole set.
+	plan, err = planReverse(cfg, &cfg.ForeignNodes[0], map[string]int{"smtps": 465}, "")
+	if err != nil || len(plan.Listeners) != 2 || plan.Endpoints["smtps"] != 465 || plan.Endpoints["tls"] == 0 {
+		t.Fatalf("a named type must be added: %+v err=%v", plan.Endpoints, err)
+	}
+	plan, err = planReverseFor(cfg, &cfg.ForeignNodes[0], nil, "", true, nil)
+	if err != nil || len(plan.Listeners) != 2 || plan.Endpoints["smtps"] == 0 || plan.Endpoints["https-alt"] == 0 {
+		t.Fatalf("all types must be the node's own set minus ssh: %+v err=%v", plan.Endpoints, err)
+	}
+	// A node that is already reverse keeps the listener types it has.
+	cfg.ForeignNodes[0].Reverse = true
+	cfg.ForeignNodes[0].ReverseListeners = []config.MimicListener{{Type: "smtps", Port: 465}, {Type: "https-alt", Port: 8443}}
+	plan, err = planReverse(cfg, &cfg.ForeignNodes[0], nil, "")
+	if err != nil || len(plan.Listeners) != 2 || plan.Endpoints["smtps"] == 0 || plan.Endpoints["https-alt"] == 0 {
+		t.Fatalf("a re-plan must keep the node's reverse types: %+v err=%v", plan.Endpoints, err)
 	}
 }
